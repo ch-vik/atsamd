@@ -40,6 +40,7 @@ impl Into<Hertz> for GClock {
 
 struct State {
     gclk: Gclk,
+    xosc_freq: Option<Hertz>,
 }
 
 impl State {
@@ -166,7 +167,10 @@ impl GenericClockController {
         nvmctrl: &mut Nvmctrl,
         use_external_crystal: bool,
     ) -> Self {
-        let mut state = State { gclk };
+        let mut state = State {
+            gclk,
+            xosc_freq: None,
+        };
 
         set_flash_to_half_auto_wait_state(nvmctrl);
         #[hal_cfg("clock-d21")]
@@ -230,7 +234,10 @@ impl GenericClockController {
         sysctrl: &mut Sysctrl,
         nvmctrl: &mut Nvmctrl,
     ) -> Self {
-        let mut state = State { gclk };
+        let mut state = State {
+            gclk,
+            xosc_freq: None,
+        };
 
         // No wait states needed <= 24 MHz @ 3.3v (ref. 37.12 NVM characteristics)
         #[hal_cfg("clock-d21")]
@@ -269,6 +276,64 @@ impl GenericClockController {
                 0.Hz(),
                 0.Hz(),
             ],
+            used_clocks: 0,
+        }
+    }
+
+    #[hal_macro_helper]
+    pub fn with_external_xtal(
+        gclk: Gclk,
+        pm: &mut Pm,
+        sysctrl: &mut Sysctrl,
+        nvmctrl: &mut Nvmctrl,
+        freq: Hertz,
+    ) -> Self {
+        let mut state = State {
+            gclk,
+            xosc_freq: Some(freq),
+        };
+
+        // No wait states needed <= 24 MHz @ 3.3v (ref. 37.12 NVM characteristics)
+        #[hal_cfg("clock-d21")]
+        set_flash_manual_write(nvmctrl);
+
+        // Get rid of unused warning
+        #[hal_cfg("clock-d11")]
+        let _ = nvmctrl;
+
+        enable_gclk_apb(pm);
+
+        state.reset_gclk();
+
+        sysctrl.xosc().modify(|_, w| unsafe {
+            w.xtalen()
+                .set_bit()
+                .ampgc()
+                .clear_bit()
+                .gain()
+                ._3()
+                .startup()
+                .bits(0x05)
+                .ondemand()
+                .clear_bit()
+        });
+
+        sysctrl.xosc().modify(|_, w| w.enable().set_bit());
+        while sysctrl.pclksr().read().xoscrdy().bit_is_clear() {
+            // Wait for the oscillator to stabilize
+        }
+
+        // Enable XOSC source -> GCLK0
+        state.set_gclk_divider_and_source(Gclk0, 1, Xosc, false);
+
+        pm.cpusel().write(|w| w.cpudiv().div1());
+        pm.apbasel().write(|w| w.apbadiv().div1());
+        pm.apbbsel().write(|w| w.apbbdiv().div1());
+        pm.apbcsel().write(|w| w.apbcdiv().div1());
+
+        Self {
+            state,
+            gclks: [freq, 0.Hz(), 0.Hz(), 0.Hz(), 0.Hz(), 0.Hz(), 0.Hz(), 0.Hz()],
             used_clocks: 0,
         }
     }
@@ -332,7 +397,8 @@ impl GenericClockController {
             Osc8m => OSC8M_FREQ,
             Dfll48m => OSC48M_FREQ,
             Dpll96m => 96.MHz(),
-            Gclkin | Xosc => unimplemented!(),
+            Xosc => self.state.xosc_freq.unwrap(),
+            Gclkin => unimplemented!(),
         };
         self.gclks[idx] = freq / divider as u32;
         Some(GClock { gclk, freq })
@@ -517,7 +583,8 @@ pub fn enable_external_32kosc(sysctrl: &mut Sysctrl) {
         w.en32k().set_bit();
         // Crystal connected to xin32/xout32
         w.xtalen().set_bit();
-        w.runstdby().set_bit()
+        w.runstdby().set_bit();
+        w.aampen().set_bit()
     });
     sysctrl.xosc32k().modify(|_, w| w.enable().set_bit());
     while sysctrl.pclksr().read().xosc32krdy().bit_is_clear() {
