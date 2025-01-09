@@ -287,6 +287,7 @@ impl GenericClockController {
         sysctrl: &mut Sysctrl,
         nvmctrl: &mut Nvmctrl,
         freq: Hertz,
+        run_stdby: bool,
     ) -> Self {
         let mut state = State {
             gclk,
@@ -317,6 +318,10 @@ impl GenericClockController {
                 .ondemand()
                 .clear_bit()
         });
+
+        if run_stdby {
+            sysctrl.xosc().modify(|_, w| w.runstdby().set_bit());
+        }
 
         sysctrl.xosc().modify(|_, w| w.enable().set_bit());
         while sysctrl.pclksr().read().xoscrdy().bit_is_clear() {
